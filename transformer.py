@@ -84,3 +84,101 @@ class SentenceEmbedding(nn.Module):
         x = self.dropout(x + pos)
 
         return x
+    
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, num_heads):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.d_k = d_model // num_heads
+        self.qkv_layer = nn.Linear(d_model, 3 * d_model)
+        self.linear_layer = nn.Linear(d_model, d_model)
+    
+    def forward(self, x, mask):
+        batch_size, sequence_length, _ = x.size()
+        qkv = self.qkv_layer(x)
+        qkv = qkv.reshape(batch_size, sequence_length, self.num_heads, 3 * self.head_dim)
+        qkv = qkv.permute(0, 2, 1, 3)
+        q, k, v = qkv.chunk(3, dim=-1)
+        values, _ = scaled_dot_product(q, k, v, mask)
+        values = values.permute(0, 2, 1, 3).reshape(batch_size, sequence_length, self.num_heads * self.head_dim)
+        output = self.linear_layer(values)
+
+        return output
+
+class LayerNormalization(nn.Module):
+    def __init__(self, parameters_shape, eps=1e-5):
+        super().__init__()
+        self.parameters_shape = parameters_shape
+        self.eps = eps
+        self.gamma = nn.Parameter(torch.ones(parameters_shape))
+        self.beta = nn.Parameter(torch.zeros(parameters_shape))
+    
+    def forward(self, inputs):
+        dims = [-(i + 1) for i in range(len(self.parameters_shape))]
+        mean = inputs.mean(dim=dims, keepdim=True)
+        var = ((inputs - mean) ** 2).mean(dim=dims, keepdim=True)
+        std = (var + self.eps).sqrt()
+        y = (inputs - mean) / std
+        output = self.gamma * y + self.beta
+
+        return output
+    
+class PositionwiseFeedForward(nn.Module):
+    def __init__(self, d_model, hidden, drop_prob=0.1):
+        super(PositionwiseFeedForward, self).__init__()
+        self.linear1 = nn.Linear(d_model, hidden)
+        self.linear2 = nn.Linear(hidden, d_model)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(p=drop_prob)
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = self.linear2(x)
+
+        return x
+
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model, ffn_hidden, num_heads, drop_prob):
+        super(EncoderLayer, self).__init__()
+        self.attention = MultiHeadAttention(d_model, num_heads)
+        self.norm1 = LayerNormalization([d_model])
+        self.dropout1 = nn.Dropout(drop_prob)
+        self.ffn = PositionwiseFeedForward(d_model, ffn_hidden, drop_prob)
+        self.norm2 = LayerNormalization([d_model])
+        self.dropout2 = nn.Dropout(drop_prob)
+    
+    def forward(self, x, self_attention_mask):
+        residual_x = x.clone()
+        x = self.attention(x, mask=self_attention_mask)
+        x = self.dropout1(x)
+        x = self.norm1(x + residual_x)
+        residual_x = x.clone()
+        x = self.ffn(x)
+        x = self.dropout2(x)
+        x = self.norm2(x + residual_x)
+
+        return x
+    
+class SequentialEncoder(nn.Sequential):
+    def __init__(self, *inputs):
+        x, self_attention_mask = inputs
+
+        for module in self._modules.values():
+            x = module(x, self_attention_mask)
+        
+        return x
+
+class Encoder(nn.Module):
+    def __init__(self, d_model, ffn_hidden, num_heads, drop_prob, num_layers, max_sequence_length, language_to_index, START_TOKEN, END_TOKEN, PADDING_TOKEN):
+        super().__init__()
+        self.sentence_embedding = SentenceEmbedding(max_sequence_length, d_model, language_to_index, START_TOKEN, END_TOKEN, PADDING_TOKEN)
+        self.layers = SequentialEncoder(*[EncoderLayer(d_model, ffn_hidden, num_heads, drop_prob) for _ in range(num_layers)])
+
+    def forward(self, x, self_attention_mask, START_TOKEN, END_TOKEN):
+        x = self.sentence_embedding(x, START_TOKEN, END_TOKEN)
+        x = self.layers(x, self_attention_mask)
+
+        return x
